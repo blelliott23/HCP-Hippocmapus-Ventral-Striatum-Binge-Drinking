@@ -1,0 +1,1610 @@
+---
+title: "HPC-VS Connectivity and Past-Year 5+ Drinking Frequency"
+author: "Blake Elliott"
+date: "2026-05-31"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache = FALSE
+)
+
+rmd_input <- tryCatch(knitr::current_input(), error = function(e) NULL)
+if (!is.null(rmd_input)) {
+  knitr::opts_knit$set(root.dir = dirname(normalizePath(rmd_input)))
+}
+```
+
+# HPC-VS Binge Drinking Analysis
+
+This R Markdown file runs the analyses and creates the figures reported in the
+manuscript and supplement:
+
+1. Primary proportional-odds ordinal logistic models.
+2. Permutation likelihood-ratio checks with 10,000 permutations.
+3. DFBETAS influence sensitivity checks.
+4. Sex-moderation models and conditional slopes.
+5. Age sensitivity analyses.
+6. Three-level alcohol-diagnosis follow-ups: no lifetime DSM-IV alcohol diagnosis,
+   lifetime DSM-IV alcohol abuse, and lifetime DSM-IV alcohol dependence.
+7. Diagnosis-group ANCOVAs for standardized left and right HPC-VS connectivity.
+8. Manuscript Figures 2-5.
+
+
+- `set.seed(23)`
+- `N_PERM <- 10000`
+- DFBETAS screens include max `|DFBETAS| > .20` and `2/sqrt(N)`
+
+```{r final-analysis-workflow, results='asis'}
+options(contrasts = c("contr.sum", "contr.poly"))
+set.seed(23)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(MASS)
+  library(rio)
+  library(emmeans)
+})
+
+DATA_PATH <- "Data/averaged_data.csv"
+PERM_SEED <- 23
+N_PERM <- 10000
+RMS_DFBETAS_CUTOFF <- 0.20
+
+args <- commandArgs(trailingOnly = FALSE)
+file_arg <- args[grepl("^--file=", args)]
+SCRIPT_DIR <- if (length(file_arg) == 1) dirname(normalizePath(sub("^--file=", "", file_arg))) else getwd()
+OUTPUT_DIR <- file.path(SCRIPT_DIR, "HPC_Ordinal_ManuscriptOrdered_Permutation_DFBETAS_Output")
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+fmt_num <- function(x, digits = 3) {
+  ifelse(is.na(x), "NA", formatC(x, format = "f", digits = digits))
+}
+
+fmt_p <- function(p) {
+  ifelse(
+    is.na(p),
+    "NA",
+    ifelse(p < 0.001, "< .001", sub("^0", "", formatC(p, format = "f", digits = 3)))
+  )
+}
+
+cat_line <- function(...) cat(..., "\n", sep = "")
+
+fit_polr_safe <- function(formula, data) {
+  suppressWarnings(
+    MASS::polr(formula, data = data, Hess = TRUE, method = "logistic", model = TRUE)
+  )
+}
+
+coef_table <- function(model) {
+  ct <- coef(summary(model))
+  p <- 2 * pnorm(abs(ct[, "t value"]), lower.tail = FALSE)
+
+  tibble(
+    term = rownames(ct),
+    b = ct[, "Value"],
+    SE = ct[, "Std. Error"],
+    z = ct[, "t value"],
+    p = p,
+    OR = exp(ct[, "Value"])
+  )
+}
+
+lr_stat <- function(reduced_model, full_model) {
+  2 * (as.numeric(logLik(full_model)) - as.numeric(logLik(reduced_model)))
+}
+
+lr_test <- function(reduced_model, full_model, label) {
+  lr <- lr_stat(reduced_model, full_model)
+  df <- attr(logLik(full_model), "df") - attr(logLik(reduced_model), "df")
+  tibble(
+    test = label,
+    df = df,
+    LR = lr,
+    p = pchisq(lr, df = df, lower.tail = FALSE)
+  )
+}
+
+lm_block_test <- function(reduced_model, full_model, label) {
+  a <- anova(reduced_model, full_model)
+  tibble(
+    test = label,
+    df_num = a$Df[2],
+    df_den = a$Res.Df[2],
+    F = a$F[2],
+    p = a$`Pr(>F)`[2]
+  )
+}
+
+lm_coef_table <- function(model) {
+  ct <- coef(summary(model))
+  tibble(
+    term = rownames(ct),
+    b = ct[, "Estimate"],
+    SE = ct[, "Std. Error"],
+    t = ct[, "t value"],
+    p = ct[, "Pr(>|t|)"]
+  )
+}
+
+fmt_count_pct <- function(n, denom) {
+  paste0(n, " (", fmt_num(100 * n / denom, 1), "%)")
+}
+
+perm_lr_test <- function(reduced_formula, full_formula, data, label, n_perm = N_PERM, seed = PERM_SEED) {
+  set.seed(seed)
+
+  reduced_obs <- fit_polr_safe(reduced_formula, data)
+  full_obs <- fit_polr_safe(full_formula, data)
+  observed_lr <- lr_stat(reduced_obs, full_obs)
+
+  perm_stats <- replicate(n_perm, {
+    dat_p <- data
+    dat_p$y <- sample(dat_p$y, replace = FALSE)
+
+    val <- try({
+      red_p <- fit_polr_safe(reduced_formula, dat_p)
+      full_p <- fit_polr_safe(full_formula, dat_p)
+      lr_stat(red_p, full_p)
+    }, silent = TRUE)
+
+    if (inherits(val, "try-error") || !is.finite(val)) NA_real_ else val
+  })
+
+  perm_stats <- perm_stats[is.finite(perm_stats)]
+  p_perm <- (sum(perm_stats >= observed_lr) + 1) / (length(perm_stats) + 1)
+
+  tibble(
+    test = label,
+    LR = observed_lr,
+    p_perm = p_perm,
+    n_success = length(perm_stats)
+  )
+}
+
+print_coef_line <- function(model, term, label = term) {
+  x <- coef_table(model) %>% filter(.data$term == !!term)
+  cat_line(
+    "  ", label,
+    ": b = ", fmt_num(x$b, 4),
+    ", SE = ", fmt_num(x$SE, 4),
+    ", z = ", fmt_num(x$z, 3),
+    ", p = ", fmt_p(x$p),
+    ", OR = ", fmt_num(x$OR, 3)
+  )
+}
+
+print_coef_line_any <- function(model, terms, label = terms[1]) {
+  x <- coef_table(model) %>% filter(.data$term %in% terms) %>% slice(1)
+  if (nrow(x) == 0) {
+    cat_line("  ", label, ": term not found. Available terms: ", paste(coef_table(model)$term, collapse = ", "))
+  } else {
+    cat_line(
+      "  ", label,
+      ": b = ", fmt_num(x$b, 4),
+      ", SE = ", fmt_num(x$SE, 4),
+      ", z = ", fmt_num(x$z, 3),
+      ", p = ", fmt_p(x$p),
+      ", OR = ", fmt_num(x$OR, 3)
+    )
+  }
+}
+
+print_lr_line <- function(test_row) {
+  cat_line(
+    "  ", test_row$test,
+    ": LR chi-square(", test_row$df, ") = ", fmt_num(test_row$LR, 3),
+    ", p = ", fmt_p(test_row$p)
+  )
+}
+
+print_lm_block_line <- function(test_row) {
+  cat_line(
+    "  ", test_row$test,
+    ": F(", test_row$df_num, ", ", test_row$df_den, ") = ", fmt_num(test_row$F, 3),
+    ", p = ", fmt_p(test_row$p)
+  )
+}
+
+print_perm_line <- function(test_row) {
+  cat_line(
+    "  ", test_row$test,
+    ": observed LR = ", fmt_num(test_row$LR, 3),
+    ", permutation p = ", fmt_p(test_row$p_perm),
+    " (", test_row$n_success, " successful permutations)"
+  )
+}
+
+dfbetas_screen <- function(formula, data, label) {
+  full_model <- fit_polr_safe(formula, data)
+  full_beta <- coef(full_model)
+  se_lookup <- coef_table(full_model) %>%
+    filter(.data$term %in% names(full_beta)) %>%
+    dplyr::select(term, SE)
+
+  purrr::map_dfr(seq_len(nrow(data)), function(i) {
+    deleted_model <- fit_polr_safe(formula, droplevels(data[-i, , drop = FALSE]))
+    deleted_beta <- coef(deleted_model)[names(full_beta)]
+
+    tibble(
+      model = label,
+      row_id = data$row_id[i],
+      Subject = data$Subject[i],
+      deleted_position = i,
+      term = names(full_beta),
+      dfbetas = as.numeric((deleted_beta - full_beta) / se_lookup$SE)
+    )
+  }) %>%
+    mutate(abs_dfbetas = abs(dfbetas))
+}
+
+summarize_dfbetas_cases <- function(screen_long, cutoff, cutoff_label) {
+  screen_long %>%
+    mutate(flagged_term = abs_dfbetas > cutoff) %>%
+    group_by(model, row_id, Subject) %>%
+    summarize(
+      cutoff_label = cutoff_label,
+      cutoff = cutoff,
+      max_abs_dfbetas = max(abs_dfbetas, na.rm = TRUE),
+      flagged_any = any(flagged_term),
+      flagged_terms = paste(term[flagged_term], collapse = "; "),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(max_abs_dfbetas))
+}
+
+dfbetas_refit <- function(label, data, reduced_formula, full_formula, target_term, screen_long, cutoff, cutoff_label) {
+  cases <- summarize_dfbetas_cases(screen_long, cutoff, cutoff_label)
+  flagged <- cases %>% filter(flagged_any)
+  filtered_data <- data %>% filter(!row_id %in% flagged$row_id) %>% droplevels()
+
+  reduced_full_sample <- fit_polr_safe(reduced_formula, data)
+  full_full_sample <- fit_polr_safe(full_formula, data)
+  full_coef <- coef_table(full_full_sample) %>% filter(.data$term == !!target_term)
+  full_lr <- lr_test(reduced_full_sample, full_full_sample, "Full sample")
+
+  reduced_filtered <- fit_polr_safe(reduced_formula, filtered_data)
+  full_filtered <- fit_polr_safe(full_formula, filtered_data)
+  filtered_coef <- coef_table(full_filtered) %>% filter(.data$term == !!target_term)
+  filtered_lr <- lr_test(reduced_filtered, full_filtered, cutoff_label)
+
+  result <- tibble(
+    model = label,
+    cutoff_label = cutoff_label,
+    cutoff = cutoff,
+    removed_n = nrow(flagged),
+    retained_n = nrow(filtered_data),
+    target_term = target_term,
+    b = filtered_coef$b,
+    SE = filtered_coef$SE,
+    z = filtered_coef$z,
+    p = filtered_coef$p,
+    OR = filtered_coef$OR,
+    LR = filtered_lr$LR,
+    LR_df = filtered_lr$df,
+    LR_p = filtered_lr$p
+  )
+
+  list(
+    cases = cases,
+    flagged = flagged,
+    filtered_data = filtered_data,
+    filtered_model = full_filtered,
+    result = result,
+    full_result = tibble(
+      model = label,
+      cutoff_label = "Full sample",
+      cutoff = NA_real_,
+      removed_n = 0L,
+      retained_n = nrow(data),
+      target_term = target_term,
+      b = full_coef$b,
+      SE = full_coef$SE,
+      z = full_coef$z,
+      p = full_coef$p,
+      OR = full_coef$OR,
+      LR = full_lr$LR,
+      LR_df = full_lr$df,
+      LR_p = full_lr$p
+    )
+  )
+}
+
+run_dfbetas_checks <- function(label, data, reduced_formula, full_formula, target_term) {
+  bkw_cutoff <- 2 / sqrt(nrow(data))
+  screen_long <- dfbetas_screen(full_formula, data, label)
+
+  rms <- dfbetas_refit(
+    label = label,
+    data = data,
+    reduced_formula = reduced_formula,
+    full_formula = full_formula,
+    target_term = target_term,
+    screen_long = screen_long,
+    cutoff = RMS_DFBETAS_CUTOFF,
+    cutoff_label = "max |DFBETAS| > .20"
+  )
+
+  bkw <- dfbetas_refit(
+    label = label,
+    data = data,
+    reduced_formula = reduced_formula,
+    full_formula = full_formula,
+    target_term = target_term,
+    screen_long = screen_long,
+    cutoff = bkw_cutoff,
+    cutoff_label = paste0("max |DFBETAS| > 2/sqrt(N) = ", fmt_num(bkw_cutoff, 4))
+  )
+
+  result <- bind_rows(rms$full_result, rms$result, bkw$result)
+
+  readr::write_csv(screen_long, file.path(OUTPUT_DIR, paste0(label, "_dfbetas_long.csv")))
+  readr::write_csv(rms$cases, file.path(OUTPUT_DIR, paste0(label, "_dfbetas_cases_rms020.csv")))
+  readr::write_csv(bkw$cases, file.path(OUTPUT_DIR, paste0(label, "_dfbetas_cases_bkw.csv")))
+
+  cat_line("  DFBETAS sensitivity for ", label, ":")
+  for (i in seq_len(nrow(result))) {
+    x <- result[i, ]
+    cat_line(
+      "    ", x$cutoff_label,
+      ": removed N = ", x$removed_n,
+      ", retained N = ", x$retained_n,
+      ", b = ", fmt_num(x$b, 4),
+      ", SE = ", fmt_num(x$SE, 4),
+      ", z = ", fmt_num(x$z, 3),
+      ", p = ", fmt_p(x$p),
+      ", LR chi-square(", x$LR_df, ") = ", fmt_num(x$LR, 3),
+      ", LR p = ", fmt_p(x$LR_p)
+    )
+  }
+
+  list(screen_long = screen_long, rms = rms, bkw = bkw, result = result)
+}
+
+simple_slopes <- function(model, var_name, label) {
+  trends <- emmeans::emtrends(model, specs = ~ Sex, var = var_name, mode = "latent")
+  slopes <- as.data.frame(summary(trends, infer = c(TRUE, TRUE))) %>%
+    as_tibble() %>%
+    transmute(
+      analysis = label,
+      contrast = as.character(Sex),
+      b = !!sym(paste0(var_name, ".trend")),
+      SE = SE,
+      z = z.ratio,
+      p = p.value,
+      lower.CL = asymp.LCL,
+      upper.CL = asymp.UCL
+    )
+
+  diff <- as.data.frame(summary(pairs(trends), infer = c(TRUE, TRUE))) %>%
+    as_tibble() %>%
+    transmute(
+      analysis = label,
+      contrast = as.character(contrast),
+      b = estimate,
+      SE = SE,
+      z = z.ratio,
+      p = p.value,
+      lower.CL = asymp.LCL,
+      upper.CL = asymp.UCL
+    )
+
+  bind_rows(slopes, diff)
+}
+
+print_simple_slopes <- function(slopes_tbl, label) {
+  cat_line("  Simple slopes for ", label, ":")
+  for (i in seq_len(nrow(slopes_tbl))) {
+    x <- slopes_tbl[i, ]
+    cat_line(
+      "    ", x$contrast,
+      ": b = ", fmt_num(x$b, 4),
+      ", SE = ", fmt_num(x$SE, 4),
+      ", z = ", fmt_num(x$z, 3),
+      ", p = ", fmt_p(x$p),
+      ", 95% CI [", fmt_num(x$lower.CL, 4), ", ", fmt_num(x$upper.CL, 4), "]"
+    )
+  }
+}
+
+HCP_dat <- rio::import(DATA_PATH)
+
+analysis_dat <- HCP_dat %>%
+  mutate(
+    Subject = as.character(Subject),
+    Sex = factor(trimws(Gender), levels = c("F", "M")),
+    binge_freq_rc = case_when(
+      SSAGA_Alc_12_Frq_5plus == 5 ~ 1L,
+      SSAGA_Alc_12_Frq_5plus == 4 ~ 2L,
+      SSAGA_Alc_12_Frq_5plus == 3 ~ 3L,
+      SSAGA_Alc_12_Frq_5plus %in% c(1L, 2L) ~ 4L,
+      TRUE ~ NA_integer_
+    ),
+    binge_freq_rc_f = factor(
+      binge_freq_rc,
+      levels = c(1, 2, 3, 4),
+      labels = c("Never", "1-11 d/year", "1-3 d/month", "Weekly or greater"),
+      ordered = TRUE
+    ),
+    alcohol_abuse_dx = case_when(
+      SSAGA_Alc_D4_Ab_Dx == 5 ~ TRUE,
+      SSAGA_Alc_D4_Ab_Dx == 1 ~ FALSE,
+      TRUE ~ NA
+    ),
+    alcohol_dependence_dx = case_when(
+      SSAGA_Alc_D4_Dp_Dx == 5 ~ TRUE,
+      SSAGA_Alc_D4_Dp_Dx == 1 ~ FALSE,
+      TRUE ~ NA
+    ),
+    AUD = factor(
+      if_else(alcohol_abuse_dx | alcohol_dependence_dx, "AUD", "No AUD"),
+      levels = c("No AUD", "AUD")
+    ),
+    DxGroup = factor(
+      case_when(
+        alcohol_dependence_dx ~ "Dependence",
+        alcohol_abuse_dx ~ "Abuse",
+        alcohol_abuse_dx == FALSE & alcohol_dependence_dx == FALSE ~ "No AUD",
+        TRUE ~ NA_character_
+      ),
+      levels = c("No AUD", "Abuse", "Dependence")
+    )
+  ) %>%
+  transmute(
+    row_id = row_number(),
+    Subject,
+    Sex,
+    y = binge_freq_rc_f,
+    alcohol_abuse_dx,
+    alcohol_dependence_dx,
+    AUD,
+    DxGroup,
+    left_hpc_vs = as.numeric(limbic_Left),
+    right_hpc_vs = as.numeric(limbic_Right),
+    ICV = as.numeric(FS_IntraCranial_Vol),
+    Age = as.numeric(Age_in_Yrs)
+  ) %>%
+  filter(
+    is.finite(left_hpc_vs),
+    is.finite(right_hpc_vs),
+    is.finite(ICV),
+    is.finite(Age),
+    !is.na(y),
+    !is.na(Sex),
+    !is.na(AUD),
+    !is.na(DxGroup)
+  ) %>%
+  mutate(
+    c_left_hpc_vs = as.numeric(scale(left_hpc_vs)),
+    c_right_hpc_vs = as.numeric(scale(right_hpc_vs)),
+    c_ICV = as.numeric(scale(ICV)),
+    c_Age = as.numeric(scale(Age))
+  ) %>%
+  droplevels()
+
+contrasts(analysis_dat$AUD) <- matrix(
+  c(0, 1),
+  ncol = 1,
+  dimnames = list(levels(analysis_dat$AUD), "AUD")
+)
+contrasts(analysis_dat$DxGroup) <- matrix(
+  c(0, 1, 0, 0, 0, 1),
+  ncol = 2,
+  dimnames = list(levels(analysis_dat$DxGroup), c("Abuse", "Dependence"))
+)
+
+left_dat <- analysis_dat %>%
+  dplyr::select(row_id, Subject, Sex, y, c_left_hpc_vs, c_ICV, c_Age) %>%
+  droplevels()
+
+right_dat <- analysis_dat %>%
+  dplyr::select(row_id, Subject, Sex, y, c_right_hpc_vs, c_ICV, c_Age) %>%
+  droplevels()
+
+cat_line(strrep("=", 90))
+cat_line("HPC ORDINAL WORKFLOW: PRIMARY MODELS FOLLOWED BY PERMUTATION AND DFBETAS CHECKS")
+cat_line(strrep("=", 90))
+cat_line("Analysis N = ", nrow(analysis_dat))
+cat_line("Permutation settings: seed = ", PERM_SEED, "; target permutations = ", N_PERM, ".")
+cat_line("Permutation method: shuffle ordinal outcome labels, refit reduced/full proportional-odds models, and compare observed LR to empirical null LR distribution.")
+cat_line("Permutation p-values use the plus-one correction: (number of permuted LR values >= observed LR + 1) / (successful permutations + 1).")
+cat_line("DFBETAS method: refit the proportional-odds model after deleting one participant at a time; DFBETAS = leave-one-out coefficient change / full-sample SE.")
+cat_line("DFBETAS screens: rms-style max |DFBETAS| > .20 and Belsley-Kuh-Welsch max |DFBETAS| > 2/sqrt(N).")
+
+left_base <- fit_polr_safe(y ~ c_ICV, data = left_dat)
+left_main <- fit_polr_safe(y ~ c_ICV + c_left_hpc_vs, data = left_dat)
+right_base <- fit_polr_safe(y ~ c_ICV, data = right_dat)
+right_main <- fit_polr_safe(y ~ c_ICV + c_right_hpc_vs, data = right_dat)
+
+cat_line("\n", strrep("=", 90))
+cat_line("SECTION 1: MAIN-EFFECT MODELS")
+cat_line(strrep("=", 90))
+
+cat_line("\n1A. Left hemisphere main effect")
+print_coef_line(left_main, "c_left_hpc_vs", "Left HPC-VS connectivity")
+left_main_lr <- lr_test(left_base, left_main, "Left main effect: add HPC-VS connectivity")
+print_lr_line(left_main_lr)
+
+cat_line("\nChecks for 1A")
+left_main_perm <- perm_lr_test(
+  y ~ c_ICV,
+  y ~ c_ICV + c_left_hpc_vs,
+  left_dat,
+  "Permutation LR, left main effect"
+)
+print_perm_line(left_main_perm)
+left_main_dfb <- run_dfbetas_checks(
+  "left_main",
+  left_dat,
+  y ~ c_ICV,
+  y ~ c_ICV + c_left_hpc_vs,
+  "c_left_hpc_vs"
+)
+
+cat_line("\n1B. Right hemisphere main effect")
+print_coef_line(right_main, "c_right_hpc_vs", "Right HPC-VS connectivity")
+right_main_lr <- lr_test(right_base, right_main, "Right main effect: add HPC-VS connectivity")
+print_lr_line(right_main_lr)
+
+cat_line("\nChecks for 1B")
+right_main_perm <- perm_lr_test(
+  y ~ c_ICV,
+  y ~ c_ICV + c_right_hpc_vs,
+  right_dat,
+  "Permutation LR, right main effect"
+)
+print_perm_line(right_main_perm)
+right_main_dfb <- run_dfbetas_checks(
+  "right_main",
+  right_dat,
+  y ~ c_ICV,
+  y ~ c_ICV + c_right_hpc_vs,
+  "c_right_hpc_vs"
+)
+
+left_sex <- fit_polr_safe(y ~ c_ICV + c_left_hpc_vs + Sex, data = left_dat)
+left_int <- fit_polr_safe(y ~ c_ICV + c_left_hpc_vs * Sex, data = left_dat)
+right_sex <- fit_polr_safe(y ~ c_ICV + c_right_hpc_vs + Sex, data = right_dat)
+right_int <- fit_polr_safe(y ~ c_ICV + c_right_hpc_vs * Sex, data = right_dat)
+
+cat_line("\n", strrep("=", 90))
+cat_line("SECTION 2: SEX-MODERATION MODELS")
+cat_line(strrep("=", 90))
+
+cat_line("\n2A. Left hemisphere sex-moderation model")
+print_coef_line(left_int, "c_left_hpc_vs:Sex1", "Left HPC-VS connectivity x Sex")
+left_sex_lr <- lr_test(left_main, left_sex, "Left model: add sex")
+left_int_lr <- lr_test(left_sex, left_int, "Left model: add HPC-VS connectivity x Sex")
+print_lr_line(left_sex_lr)
+print_lr_line(left_int_lr)
+
+cat_line("\nChecks for 2A")
+left_sex_perm <- perm_lr_test(
+  y ~ c_ICV + c_left_hpc_vs,
+  y ~ c_ICV + c_left_hpc_vs + Sex,
+  left_dat,
+  "Permutation LR, left model add sex"
+)
+left_int_perm <- perm_lr_test(
+  y ~ c_ICV + c_left_hpc_vs + Sex,
+  y ~ c_ICV + c_left_hpc_vs * Sex,
+  left_dat,
+  "Permutation LR, left interaction"
+)
+print_perm_line(left_sex_perm)
+print_perm_line(left_int_perm)
+left_int_dfb <- run_dfbetas_checks(
+  "left_interaction",
+  left_dat,
+  y ~ c_ICV + c_left_hpc_vs + Sex,
+  y ~ c_ICV + c_left_hpc_vs * Sex,
+  "c_left_hpc_vs:Sex1"
+)
+
+cat_line("\nLeft conditional slopes by sex")
+left_slopes_full <- simple_slopes(left_int, "c_left_hpc_vs", "Full sample")
+left_slopes_rms <- simple_slopes(left_int_dfb$rms$filtered_model, "c_left_hpc_vs", "After max |DFBETAS| > .20 removal")
+left_slopes_bkw <- simple_slopes(left_int_dfb$bkw$filtered_model, "c_left_hpc_vs", "After max |DFBETAS| > 2/sqrt(N) removal")
+print_simple_slopes(left_slopes_full, "left interaction, full sample")
+print_simple_slopes(left_slopes_rms, "left interaction after .20 DFBETAS removal")
+print_simple_slopes(left_slopes_bkw, "left interaction after 2/sqrt(N) DFBETAS removal")
+
+cat_line("\n2B. Right hemisphere sex-moderation model")
+print_coef_line(right_int, "c_right_hpc_vs:Sex1", "Right HPC-VS connectivity x Sex")
+right_sex_lr <- lr_test(right_main, right_sex, "Right model: add sex")
+right_int_lr <- lr_test(right_sex, right_int, "Right model: add HPC-VS connectivity x Sex")
+print_lr_line(right_sex_lr)
+print_lr_line(right_int_lr)
+
+cat_line("\nChecks for 2B")
+right_sex_perm <- perm_lr_test(
+  y ~ c_ICV + c_right_hpc_vs,
+  y ~ c_ICV + c_right_hpc_vs + Sex,
+  right_dat,
+  "Permutation LR, right model add sex"
+)
+right_int_perm <- perm_lr_test(
+  y ~ c_ICV + c_right_hpc_vs + Sex,
+  y ~ c_ICV + c_right_hpc_vs * Sex,
+  right_dat,
+  "Permutation LR, right interaction"
+)
+print_perm_line(right_sex_perm)
+print_perm_line(right_int_perm)
+right_int_dfb <- run_dfbetas_checks(
+  "right_interaction",
+  right_dat,
+  y ~ c_ICV + c_right_hpc_vs + Sex,
+  y ~ c_ICV + c_right_hpc_vs * Sex,
+  "c_right_hpc_vs:Sex1"
+)
+
+cat_line("\nRight conditional slopes by sex")
+right_slopes_full <- simple_slopes(right_int, "c_right_hpc_vs", "Full sample")
+right_slopes_rms <- simple_slopes(right_int_dfb$rms$filtered_model, "c_right_hpc_vs", "After max |DFBETAS| > .20 removal")
+right_slopes_bkw <- simple_slopes(right_int_dfb$bkw$filtered_model, "c_right_hpc_vs", "After max |DFBETAS| > 2/sqrt(N) removal")
+print_simple_slopes(right_slopes_full, "right interaction, full sample")
+print_simple_slopes(right_slopes_rms, "right interaction after .20 DFBETAS removal")
+print_simple_slopes(right_slopes_bkw, "right interaction after 2/sqrt(N) DFBETAS removal")
+
+cat_line("\n", strrep("=", 90))
+cat_line("SECTION 3: AGE SENSITIVITY MODELS")
+cat_line(strrep("=", 90))
+
+cat_line("\n3A. Left hemisphere main effect with age covariate")
+left_age_reduced <- fit_polr_safe(y ~ c_ICV + c_Age, data = left_dat)
+left_age_full <- fit_polr_safe(y ~ c_ICV + c_Age + c_left_hpc_vs, data = left_dat)
+print_coef_line(left_age_full, "c_left_hpc_vs", "Left HPC-VS connectivity, age-adjusted")
+left_age_lr <- lr_test(left_age_reduced, left_age_full, "Left + age: add HPC-VS connectivity")
+print_lr_line(left_age_lr)
+
+cat_line("\n3B. Right hemisphere interaction with age covariate")
+right_age_reduced <- fit_polr_safe(
+  y ~ c_ICV + c_Age + c_right_hpc_vs + Sex,
+  data = right_dat
+)
+right_age_full <- fit_polr_safe(
+  y ~ c_ICV + c_Age + c_right_hpc_vs * Sex,
+  data = right_dat
+)
+print_coef_line(right_age_full, "c_right_hpc_vs:Sex1", "Right HPC-VS connectivity x Sex, age-adjusted")
+right_age_lr <- lr_test(right_age_reduced, right_age_full, "Right + age: add HPC-VS connectivity x Sex")
+print_lr_line(right_age_lr)
+
+cat_line("\n3C. Left hemisphere continuous-age moderation")
+left_age_mod_reduced <- fit_polr_safe(
+  y ~ c_ICV + c_Age + c_left_hpc_vs,
+  data = left_dat
+)
+left_age_mod_full <- fit_polr_safe(
+  y ~ c_ICV + c_Age * c_left_hpc_vs,
+  data = left_dat
+)
+print_coef_line(left_age_mod_full, "c_Age:c_left_hpc_vs", "Left HPC-VS connectivity x Age")
+left_age_mod_lr <- lr_test(left_age_mod_reduced, left_age_mod_full, "Left: add HPC-VS connectivity x Age")
+print_lr_line(left_age_mod_lr)
+
+cat_line("\n3D. Right hemisphere continuous-age moderation")
+right_age_mod_reduced <- fit_polr_safe(
+  y ~ c_ICV + c_Age + c_right_hpc_vs * Sex,
+  data = right_dat
+)
+right_age_mod_full <- fit_polr_safe(
+  y ~ c_ICV + c_Age + c_right_hpc_vs * Sex + c_right_hpc_vs:c_Age + Sex:c_Age + c_right_hpc_vs:Sex:c_Age,
+  data = right_dat
+)
+print_coef_line_any(
+  right_age_mod_full,
+  c("c_right_hpc_vs:Sex1:c_Age", "c_Age:c_right_hpc_vs:Sex1", "c_right_hpc_vs:c_Age:Sex1"),
+  "Right HPC-VS connectivity x Sex x Age"
+)
+right_age_mod_lr <- lr_test(right_age_mod_reduced, right_age_mod_full, "Right: add age moderation terms")
+print_lr_line(right_age_mod_lr)
+
+cat_line("\n", strrep("=", 90))
+cat_line("SECTION 4: ALCOHOL DIAGNOSIS DESCRIPTIVES AND EXPLORATORY CHECKS")
+cat_line(strrep("=", 90))
+cat_line("Diagnosis variables available in this dataset are DSM-IV alcohol abuse/dependence criteria-met indicators.")
+
+sex_totals <- table(analysis_dat$Sex)
+total_n <- nrow(analysis_dat)
+female_n <- unname(sex_totals["F"])
+male_n <- unname(sex_totals["M"])
+female_abuse <- sum(analysis_dat$Sex == "F" & analysis_dat$alcohol_abuse_dx)
+male_abuse <- sum(analysis_dat$Sex == "M" & analysis_dat$alcohol_abuse_dx)
+total_abuse <- sum(analysis_dat$alcohol_abuse_dx)
+female_dependence <- sum(analysis_dat$Sex == "F" & analysis_dat$alcohol_dependence_dx)
+male_dependence <- sum(analysis_dat$Sex == "M" & analysis_dat$alcohol_dependence_dx)
+total_dependence <- sum(analysis_dat$alcohol_dependence_dx)
+female_aud <- sum(analysis_dat$Sex == "F" & analysis_dat$AUD == "AUD")
+male_aud <- sum(analysis_dat$Sex == "M" & analysis_dat$AUD == "AUD")
+total_aud <- sum(analysis_dat$AUD == "AUD")
+
+diagnosis_counts <- tibble(
+  Characteristic = c(
+    "Sample size (n)",
+    "DSM-IV lifetime alcohol diagnosis: alcohol abuse, n (%)",
+    "DSM-IV lifetime alcohol diagnosis: alcohol dependence, n (%)",
+    "Any lifetime DSM-IV alcohol use disorder, n (%)"
+  ),
+  Female = c(
+    as.character(female_n),
+    fmt_count_pct(female_abuse, female_n),
+    fmt_count_pct(female_dependence, female_n),
+    fmt_count_pct(female_aud, female_n)
+  ),
+  Male = c(
+    as.character(male_n),
+    fmt_count_pct(male_abuse, male_n),
+    fmt_count_pct(male_dependence, male_n),
+    fmt_count_pct(male_aud, male_n)
+  ),
+  Total = c(
+    as.character(total_n),
+    fmt_count_pct(total_abuse, total_n),
+    fmt_count_pct(total_dependence, total_n),
+    fmt_count_pct(total_aud, total_n)
+  )
+)
+
+cat_line("\n4A. Lifetime alcohol disorder diagnosis table")
+print(diagnosis_counts)
+cat_line("\nDiagnosis group counts for connectivity ANCOVAs")
+print(table(analysis_dat$DxGroup))
+
+cat_line("\n4B. Three-level diagnosis-group moderation of ordinal drinking-frequency models")
+cat_line("  Diagnosis groups: No AUD, DSM-IV alcohol abuse, DSM-IV alcohol dependence.")
+left_dx_mod_reduced <- fit_polr_safe(y ~ c_ICV + DxGroup + c_left_hpc_vs, data = analysis_dat)
+left_dx_mod_full <- fit_polr_safe(y ~ c_ICV + DxGroup * c_left_hpc_vs, data = analysis_dat)
+left_dx_mod_lr <- lr_test(left_dx_mod_reduced, left_dx_mod_full, "Left: add diagnosis group x HPC-VS connectivity")
+print_coef_line_any(
+  left_dx_mod_full,
+  c(
+    "DxGroupAbuse:c_left_hpc_vs",
+    "c_left_hpc_vs:DxGroupAbuse",
+    "DxGroupDependence:c_left_hpc_vs",
+    "c_left_hpc_vs:DxGroupDependence"
+  ),
+  "Three-level diagnosis group x Left HPC-VS connectivity"
+)
+print_lr_line(left_dx_mod_lr)
+
+right_dx_mod_reduced <- fit_polr_safe(
+  y ~ c_ICV + DxGroup + c_right_hpc_vs * Sex,
+  data = analysis_dat
+)
+right_dx_mod_full <- fit_polr_safe(
+  y ~ c_ICV + c_right_hpc_vs * Sex * DxGroup,
+  data = analysis_dat
+)
+right_dx_mod_lr <- lr_test(right_dx_mod_reduced, right_dx_mod_full, "Right: add diagnosis-group moderation terms")
+print_coef_line_any(
+  right_dx_mod_full,
+  c(
+    "c_right_hpc_vs:Sex1:DxGroupAbuse",
+    "c_right_hpc_vs:DxGroupAbuse:Sex1",
+    "Sex1:c_right_hpc_vs:DxGroupAbuse",
+    "c_right_hpc_vs:Sex1:DxGroupDependence",
+    "c_right_hpc_vs:DxGroupDependence:Sex1",
+    "Sex1:c_right_hpc_vs:DxGroupDependence"
+  ),
+  "Right HPC-VS connectivity x Sex x three-level diagnosis group"
+)
+print_lr_line(right_dx_mod_lr)
+
+cat_line("\n4C. Separate ANCOVAs testing whether HPC-VS connectivity differs by diagnosis group")
+cat_line("  Diagnosis groups: No AUD, DSM-IV alcohol abuse, DSM-IV alcohol dependence.")
+left_conn_reduced <- lm(c_left_hpc_vs ~ Sex + c_ICV, data = analysis_dat)
+left_conn_full <- lm(c_left_hpc_vs ~ DxGroup + Sex + c_ICV, data = analysis_dat)
+right_conn_reduced <- lm(c_right_hpc_vs ~ Sex + c_ICV, data = analysis_dat)
+right_conn_full <- lm(c_right_hpc_vs ~ DxGroup + Sex + c_ICV, data = analysis_dat)
+left_conn_ancova <- lm_block_test(left_conn_reduced, left_conn_full, "Left HPC-VS connectivity: add diagnosis group")
+right_conn_ancova <- lm_block_test(right_conn_reduced, right_conn_full, "Right HPC-VS connectivity: add diagnosis group")
+print_lm_block_line(left_conn_ancova)
+print_lm_block_line(right_conn_ancova)
+
+left_conn_emm <- emmeans::emmeans(left_conn_full, ~ DxGroup)
+right_conn_emm <- emmeans::emmeans(right_conn_full, ~ DxGroup)
+diagnosis_connectivity_emmeans <- bind_rows(
+  as_tibble(as.data.frame(summary(left_conn_emm))) %>%
+    mutate(hemisphere = "Left", .before = 1),
+  as_tibble(as.data.frame(summary(right_conn_emm))) %>%
+    mutate(hemisphere = "Right", .before = 1)
+)
+diagnosis_connectivity_pairwise <- bind_rows(
+  as_tibble(as.data.frame(summary(pairs(left_conn_emm), infer = c(TRUE, TRUE)))) %>%
+    mutate(hemisphere = "Left", .before = 1),
+  as_tibble(as.data.frame(summary(pairs(right_conn_emm), infer = c(TRUE, TRUE)))) %>%
+    mutate(hemisphere = "Right", .before = 1)
+)
+cat_line("\n  Estimated marginal means for z-scored HPC-VS connectivity by diagnosis group")
+print(diagnosis_connectivity_emmeans)
+
+results_primary <- bind_rows(
+  left_main_lr,
+  right_main_lr,
+  left_sex_lr,
+  left_int_lr,
+  right_sex_lr,
+  right_int_lr
+)
+
+results_permutation <- bind_rows(
+  left_main_perm,
+  right_main_perm,
+  left_sex_perm,
+  left_int_perm,
+  right_sex_perm,
+  right_int_perm
+)
+
+results_dfbetas <- bind_rows(
+  left_main_dfb$result,
+  right_main_dfb$result,
+  left_int_dfb$result,
+  right_int_dfb$result
+)
+
+results_slopes <- bind_rows(
+  left_slopes_full %>% mutate(hemisphere = "Left", .before = 1),
+  left_slopes_rms %>% mutate(hemisphere = "Left", .before = 1),
+  left_slopes_bkw %>% mutate(hemisphere = "Left", .before = 1),
+  right_slopes_full %>% mutate(hemisphere = "Right", .before = 1),
+  right_slopes_rms %>% mutate(hemisphere = "Right", .before = 1),
+  right_slopes_bkw %>% mutate(hemisphere = "Right", .before = 1)
+)
+
+results_age_sensitivity <- bind_rows(
+  left_age_lr,
+  right_age_lr,
+  left_age_mod_lr,
+  right_age_mod_lr
+)
+
+results_diagnosis_moderation <- bind_rows(
+  left_dx_mod_lr,
+  right_dx_mod_lr
+)
+
+results_diagnosis_ancova <- bind_rows(
+  left_conn_ancova,
+  right_conn_ancova
+)
+
+readr::write_csv(results_primary, file.path(OUTPUT_DIR, "primary_lr_tests.csv"))
+readr::write_csv(results_permutation, file.path(OUTPUT_DIR, "permutation_lr_tests.csv"))
+readr::write_csv(results_dfbetas, file.path(OUTPUT_DIR, "dfbetas_sensitivity_results.csv"))
+readr::write_csv(results_slopes, file.path(OUTPUT_DIR, "right_interaction_simple_slopes.csv"))
+readr::write_csv(results_slopes, file.path(OUTPUT_DIR, "left_right_interaction_simple_slopes.csv"))
+readr::write_csv(results_age_sensitivity, file.path(OUTPUT_DIR, "age_sensitivity_results.csv"))
+readr::write_csv(diagnosis_counts, file.path(OUTPUT_DIR, "diagnosis_counts.csv"))
+readr::write_csv(results_diagnosis_moderation, file.path(OUTPUT_DIR, "diagnosis_moderation_ordinal_results.csv"))
+readr::write_csv(results_diagnosis_ancova, file.path(OUTPUT_DIR, "diagnosis_group_connectivity_ancova_results.csv"))
+readr::write_csv(diagnosis_connectivity_emmeans, file.path(OUTPUT_DIR, "diagnosis_group_connectivity_emmeans.csv"))
+readr::write_csv(diagnosis_connectivity_pairwise, file.path(OUTPUT_DIR, "diagnosis_group_connectivity_pairwise.csv"))
+
+cat_line("\n", strrep("=", 90))
+cat_line("OUTPUT FILES")
+cat_line(strrep("=", 90))
+cat_line("Wrote output directory: ", OUTPUT_DIR)
+cat_line("  primary_lr_tests.csv")
+cat_line("  permutation_lr_tests.csv")
+cat_line("  dfbetas_sensitivity_results.csv")
+cat_line("  right_interaction_simple_slopes.csv")
+cat_line("  left_right_interaction_simple_slopes.csv")
+cat_line("  age_sensitivity_results.csv")
+cat_line("  diagnosis_counts.csv")
+cat_line("  diagnosis_moderation_ordinal_results.csv")
+cat_line("  diagnosis_group_connectivity_ancova_results.csv")
+cat_line("  diagnosis_group_connectivity_emmeans.csv")
+cat_line("  diagnosis_group_connectivity_pairwise.csv")
+cat_line("  model-specific DFBETAS long/case CSVs")
+```
+
+# Final Figure 2
+
+This section regenerates the sex-stratified drinking-frequency distribution figure
+and saves PNG/TIF versions at 300 dpi.
+
+```{r final-figure-2}
+options(contrasts = c("contr.sum", "contr.poly"))
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(rio)
+  library(ggplot2)
+  library(scales)
+})
+
+DATA_PATH <- "/Users/tup45568/Library/CloudStorage/OneDrive-TempleUniversity/0.Experiments/HPC_Drinking/averaged_data.sav"
+
+args <- commandArgs(trailingOnly = FALSE)
+file_arg <- args[grepl("^--file=", args)]
+SCRIPT_DIR <- if (length(file_arg) == 1) dirname(normalizePath(sub("^--file=", "", file_arg))) else getwd()
+OUTPUT_DIR <- file.path(SCRIPT_DIR, "Figures")
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+HCP_dat <- rio::import(DATA_PATH)
+
+analysis_dat <- HCP_dat %>%
+  mutate(
+    Subject = as.character(Subject),
+    Sex = factor(trimws(Gender), levels = c("F", "M")),
+    binge_freq_rc = case_when(
+      SSAGA_Alc_12_Frq_5plus == 5 ~ 1L,
+      SSAGA_Alc_12_Frq_5plus == 4 ~ 2L,
+      SSAGA_Alc_12_Frq_5plus == 3 ~ 3L,
+      SSAGA_Alc_12_Frq_5plus %in% c(1L, 2L) ~ 4L,
+      TRUE ~ NA_integer_
+    ),
+    binge_freq_rc_f = factor(
+      binge_freq_rc,
+      levels = c(1, 2, 3, 4),
+      labels = c("Never", "1-11 d/year", "1-3 d/month", "Weekly or greater"),
+      ordered = TRUE
+    )
+  ) %>%
+  transmute(
+    Subject,
+    Sex,
+    y = binge_freq_rc_f,
+    left_hpc_vs = as.numeric(limbic_Left),
+    right_hpc_vs = as.numeric(limbic_Right),
+    ICV = as.numeric(FS_IntraCranial_Vol),
+    Age = as.numeric(Age_in_Yrs)
+  ) %>%
+  filter(
+    is.finite(left_hpc_vs),
+    is.finite(right_hpc_vs),
+    is.finite(ICV),
+    is.finite(Age),
+    !is.na(y),
+    !is.na(Sex)
+  ) %>%
+  droplevels()
+
+plot_dat_dist <- analysis_dat %>%
+  count(Sex, y, name = "n") %>%
+  group_by(Sex) %>%
+  mutate(
+    prop = n / sum(n),
+    label = if_else(
+      prop < .13,
+      paste0(n, " (", percent(prop, accuracy = 1), ")"),
+      paste0(n, "\n(", percent(prop, accuracy = 1), ")")
+    ),
+    text_color = if_else(y == "Weekly or greater", "white", "black")
+  ) %>%
+  ungroup()
+
+write_csv(plot_dat_dist, file.path(OUTPUT_DIR, "Figure2_DrinkingFrequencyBySex_counts.csv"))
+
+fig_dist <- ggplot(plot_dat_dist, aes(x = Sex, y = prop, fill = y)) +
+  geom_col(width = 0.68, color = "white", linewidth = 1.0) +
+  geom_text(
+    aes(label = label, color = text_color),
+    position = position_stack(vjust = 0.5),
+    size = 6.0,
+    lineheight = 0.88,
+    fontface = "bold"
+  ) +
+  scale_color_identity() +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Never" = "#dbeafe",
+      "1-11 d/year" = "#93c5fd",
+      "1-3 d/month" = "#3b82f6",
+      "Weekly or greater" = "#1e3a8a"
+    )
+  ) +
+  labs(
+    x = "Sex",
+    y = "Percent within sex",
+    fill = "Past-year 5+ drinking frequency",
+    title = "Distribution of past-year 5+ drinking\nfrequency by sex"
+  ) +
+  theme_bw(base_size = 24) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 30, lineheight = 0.94, margin = margin(b = 12)),
+    axis.title = element_text(size = 27),
+    axis.text = element_text(size = 25, color = "gray15"),
+    legend.title = element_text(size = 23),
+    legend.text = element_text(size = 22),
+    legend.key.height = unit(0.34, "in"),
+    legend.key.width = unit(0.44, "in"),
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "gray88", linewidth = 0.7),
+    plot.margin = margin(18, 24, 18, 24)
+  )
+
+png_path <- file.path(OUTPUT_DIR, "Figure2_DrinkingFrequencyBySex_LargerFont_300dpi.png")
+tif_path <- file.path(OUTPUT_DIR, "Figure2_DrinkingFrequencyBySex_LargerFont_300dpi.tif")
+
+ggsave(png_path, fig_dist, width = 13.5, height = 8.2, units = "in", dpi = 300, bg = "white")
+ggsave(tif_path, fig_dist, width = 13.5, height = 8.2, units = "in", dpi = 300, bg = "white", compression = "lzw")
+
+cat("Analysis N:", nrow(analysis_dat), "\n")
+cat("Sex counts:\n")
+print(count(analysis_dat, Sex))
+cat("Drinking-frequency counts used in Figure 2:\n")
+print(plot_dat_dist %>% dplyr::select(Sex, y, n, prop))
+cat(png_path, "\n", sep = "")
+cat(tif_path, "\n", sep = "")
+```
+
+# Final Figures 3 And 4
+
+This section regenerates the pooled and sex-stratified HPC-VS ordinal association
+figures with bootstrap confidence ribbons and saves PNG/TIF versions at 300 dpi.
+
+```{r final-figures-3-4}
+options(contrasts = c("contr.sum", "contr.poly"))
+set.seed(23)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(MASS)
+  library(rio)
+  library(emmeans)
+  library(ggplot2)
+  library(patchwork)
+})
+
+DATA_PATH <- "/Users/tup45568/Library/CloudStorage/OneDrive-TempleUniversity/0.Experiments/HPC_Drinking/averaged_data.sav"
+
+args <- commandArgs(trailingOnly = FALSE)
+file_arg <- args[grepl("^--file=", args)]
+SCRIPT_DIR <- if (length(file_arg) == 1) dirname(normalizePath(sub("^--file=", "", file_arg))) else getwd()
+OUTPUT_DIR <- file.path(SCRIPT_DIR, "Figures")
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+fit_polr_safe <- function(formula, data) {
+  suppressWarnings(
+    MASS::polr(formula, data = data, Hess = TRUE, method = "logistic", model = TRUE)
+  )
+}
+
+boot_expected_ci <- function(data, formula, grid, B = 500, seed = 23) {
+  set.seed(seed)
+  n <- nrow(data)
+  boot_mat <- matrix(NA_real_, nrow = nrow(grid), ncol = B)
+
+  for (b in seq_len(B)) {
+    idx <- sample.int(n, size = n, replace = TRUE)
+    dat_b <- droplevels(data[idx, , drop = FALSE])
+
+    fit_b <- try(
+      suppressWarnings(MASS::polr(formula, data = dat_b, Hess = FALSE, method = "logistic")),
+      silent = TRUE
+    )
+
+    if (!inherits(fit_b, "try-error")) {
+      vals <- try(expected_from_polr(fit_b, grid), silent = TRUE)
+      if (!inherits(vals, "try-error")) {
+        boot_mat[, b] <- vals
+      }
+    }
+  }
+
+  tibble(
+    ymin = apply(boot_mat, 1, quantile, probs = 0.025, na.rm = TRUE),
+    ymax = apply(boot_mat, 1, quantile, probs = 0.975, na.rm = TRUE)
+  )
+}
+
+expected_from_polr <- function(model, newdata) {
+  probs <- as.data.frame(predict(model, newdata = newdata, type = "probs"))
+  probs[, "Never"] * 1 +
+    probs[, "1-11 d/year"] * 2 +
+    probs[, "1-3 d/month"] * 3 +
+    probs[, "Weekly or greater"] * 4
+}
+
+coef_table_fig <- function(model) {
+  ct <- coef(summary(model))
+  tibble(
+    term = rownames(ct),
+    b = ct[, "Value"],
+    SE = ct[, "Std. Error"],
+    z = ct[, "t value"],
+    p = 2 * pnorm(abs(ct[, "t value"]), lower.tail = FALSE)
+  )
+}
+
+simple_slopes_fig <- function(model, var_name) {
+  trends <- emmeans::emtrends(model, specs = ~ Sex, var = var_name, mode = "latent")
+  bind_rows(
+    as_tibble(as.data.frame(summary(trends, infer = c(TRUE, TRUE)))) %>%
+      transmute(
+        contrast = as.character(Sex),
+        b = !!sym(paste0(var_name, ".trend")),
+        p = p.value
+      ),
+    as_tibble(as.data.frame(summary(pairs(trends), infer = c(TRUE, TRUE)))) %>%
+      transmute(
+        contrast = as.character(contrast),
+        b = estimate,
+        p = p.value
+      )
+  )
+}
+
+fmt_b2 <- function(x) formatC(x, format = "f", digits = 2)
+
+dfbetas_results_path <- file.path(
+  SCRIPT_DIR,
+  "HPC_Ordinal_ManuscriptOrdered_Permutation_DFBETAS_Output",
+  "dfbetas_sensitivity_results.csv"
+)
+dfbetas_results_for_figures <- if (file.exists(dfbetas_results_path)) {
+  readr::read_csv(dfbetas_results_path, show_col_types = FALSE)
+} else {
+  tibble(model = character(), cutoff_label = character(), p = numeric())
+}
+
+slopes_results_path <- file.path(
+  SCRIPT_DIR,
+  "HPC_Ordinal_ManuscriptOrdered_Permutation_DFBETAS_Output",
+  "left_right_interaction_simple_slopes.csv"
+)
+slopes_results_for_figures <- if (file.exists(slopes_results_path)) {
+  readr::read_csv(slopes_results_path, show_col_types = FALSE)
+} else {
+  tibble(hemisphere = character(), analysis = character(), contrast = character(), p = numeric())
+}
+
+if (!"hemisphere" %in% names(slopes_results_for_figures) && nrow(slopes_results_for_figures) > 0) {
+  rows_per_hemi <- nrow(slopes_results_for_figures) / 2
+  if (rows_per_hemi == floor(rows_per_hemi)) {
+    slopes_results_for_figures <- slopes_results_for_figures %>%
+      mutate(
+        hemisphere = rep(c("Left", "Right"), each = rows_per_hemi),
+        .before = 1
+      )
+  } else {
+    slopes_results_for_figures <- slopes_results_for_figures %>%
+      mutate(hemisphere = "Right", .before = 1)
+  }
+}
+
+if (!"analysis" %in% names(slopes_results_for_figures)) {
+  slopes_results_for_figures <- slopes_results_for_figures %>%
+    mutate(analysis = NA_character_)
+}
+
+if (!"contrast" %in% names(slopes_results_for_figures)) {
+  slopes_results_for_figures <- slopes_results_for_figures %>%
+    mutate(contrast = NA_character_)
+}
+
+plus_after_dfbetas <- function(model_name) {
+  out <- dfbetas_results_for_figures %>%
+    filter(.data$model == model_name, .data$cutoff_label == "max |DFBETAS| > .20")
+  nrow(out) > 0 && isTRUE(out$p[1] < 0.05)
+}
+
+sig_marks <- function(p, plus = FALSE) {
+  paste0(ifelse(isTRUE(p < 0.05), "*", ""), ifelse(plus, "+", ""))
+}
+
+main_effect_label <- function(model, term, model_name) {
+  x <- coef_table_fig(model) %>% filter(.data$term == !!term)
+  paste0("\U0001D44F = ", fmt_b2(x$b), sig_marks(x$p, FALSE))
+}
+
+sex_slope_label <- function(model, var_name, model_name) {
+  slopes <- simple_slopes_fig(model, var_name)
+  f <- slopes %>% filter(.data$contrast == "F")
+  m <- slopes %>% filter(.data$contrast == "M")
+  diff <- slopes %>% filter(.data$contrast == "F - M")
+  hemisphere <- ifelse(grepl("^left", model_name), "Left", "Right")
+  conservative_slope_sig <- function(contrast_label) {
+    if (hemisphere != "Right") return(FALSE)
+    out <- slopes_results_for_figures %>%
+      filter(
+        .data$hemisphere == hemisphere,
+        .data$analysis == "After max |DFBETAS| > 2/sqrt(N) removal",
+        .data$contrast == contrast_label
+      )
+    nrow(out) > 0 && isTRUE(out$p[1] < 0.05)
+  }
+  f_plus <- conservative_slope_sig("F")
+  m_plus <- conservative_slope_sig("M")
+  paste0(
+    "F: \U0001D44F = ", fmt_b2(f$b), sig_marks(f$p, f_plus), "\n",
+    "M: \U0001D44F = ", fmt_b2(m$b), sig_marks(m$p, m_plus), "\n",
+    "F-M: \U0001D44F = ", fmt_b2(diff$b), ifelse(isTRUE(diff$p < 0.05), "*", "")
+  )
+}
+
+HCP_dat <- rio::import(DATA_PATH)
+
+analysis_dat <- HCP_dat %>%
+  mutate(
+    Subject = as.character(Subject),
+    Sex = factor(trimws(Gender), levels = c("F", "M")),
+    binge_freq_rc = case_when(
+      SSAGA_Alc_12_Frq_5plus == 5 ~ 1L,
+      SSAGA_Alc_12_Frq_5plus == 4 ~ 2L,
+      SSAGA_Alc_12_Frq_5plus == 3 ~ 3L,
+      SSAGA_Alc_12_Frq_5plus %in% c(1L, 2L) ~ 4L,
+      TRUE ~ NA_integer_
+    ),
+    binge_freq_rc_f = factor(
+      binge_freq_rc,
+      levels = c(1, 2, 3, 4),
+      labels = c("Never", "1-11 d/year", "1-3 d/month", "Weekly or greater"),
+      ordered = TRUE
+    )
+  ) %>%
+  transmute(
+    row_id = row_number(),
+    Subject,
+    Sex,
+    y = binge_freq_rc_f,
+    left_hpc_vs = as.numeric(limbic_Left),
+    right_hpc_vs = as.numeric(limbic_Right),
+    ICV = as.numeric(FS_IntraCranial_Vol),
+    Age = as.numeric(Age_in_Yrs)
+  ) %>%
+  filter(
+    is.finite(left_hpc_vs),
+    is.finite(right_hpc_vs),
+    is.finite(ICV),
+    is.finite(Age),
+    !is.na(y),
+    !is.na(Sex)
+  ) %>%
+  mutate(
+    c_left_hpc_vs = as.numeric(scale(left_hpc_vs)),
+    c_right_hpc_vs = as.numeric(scale(right_hpc_vs)),
+    c_ICV = as.numeric(scale(ICV))
+  ) %>%
+  droplevels()
+
+left_dat <- analysis_dat %>%
+  dplyr::select(row_id, Subject, Sex, y, c_left_hpc_vs, c_ICV) %>%
+  droplevels()
+
+right_dat <- analysis_dat %>%
+  dplyr::select(row_id, Subject, Sex, y, c_right_hpc_vs, c_ICV) %>%
+  droplevels()
+
+left_main <- fit_polr_safe(y ~ c_ICV + c_left_hpc_vs, data = left_dat)
+right_main <- fit_polr_safe(y ~ c_ICV + c_right_hpc_vs, data = right_dat)
+left_int <- fit_polr_safe(y ~ c_ICV + c_left_hpc_vs * Sex, data = left_dat)
+right_int <- fit_polr_safe(y ~ c_ICV + c_right_hpc_vs * Sex, data = right_dat)
+
+left_main_label <- main_effect_label(left_main, "c_left_hpc_vs", "left_main")
+right_main_label <- main_effect_label(right_main, "c_right_hpc_vs", "right_main")
+left_sex_label <- sex_slope_label(left_int, "c_left_hpc_vs", "left_interaction")
+right_sex_label <- sex_slope_label(right_int, "c_right_hpc_vs", "right_interaction")
+
+left_main_grid <- tibble(
+  c_ICV = 0,
+  c_left_hpc_vs = seq(min(left_dat$c_left_hpc_vs), max(left_dat$c_left_hpc_vs), length.out = 200)
+)
+left_main_grid$expected_y <- expected_from_polr(left_main, left_main_grid)
+left_main_grid <- bind_cols(
+  left_main_grid,
+  boot_expected_ci(left_dat, y ~ c_ICV + c_left_hpc_vs, left_main_grid, seed = 3101)
+)
+
+right_main_grid <- tibble(
+  c_ICV = 0,
+  c_right_hpc_vs = seq(min(right_dat$c_right_hpc_vs), max(right_dat$c_right_hpc_vs), length.out = 200)
+)
+right_main_grid$expected_y <- expected_from_polr(right_main, right_main_grid)
+right_main_grid <- bind_cols(
+  right_main_grid,
+  boot_expected_ci(right_dat, y ~ c_ICV + c_right_hpc_vs, right_main_grid, seed = 3102)
+)
+
+left_sex_grid <- expand_grid(
+  c_ICV = 0,
+  Sex = levels(left_dat$Sex),
+  c_left_hpc_vs = seq(min(left_dat$c_left_hpc_vs), max(left_dat$c_left_hpc_vs), length.out = 200)
+)
+left_sex_grid$expected_y <- expected_from_polr(left_int, left_sex_grid)
+left_sex_grid <- bind_cols(
+  left_sex_grid,
+  boot_expected_ci(left_dat, y ~ c_ICV + c_left_hpc_vs * Sex, left_sex_grid, seed = 3103)
+)
+
+right_sex_grid <- expand_grid(
+  c_ICV = 0,
+  Sex = levels(right_dat$Sex),
+  c_right_hpc_vs = seq(min(right_dat$c_right_hpc_vs), max(right_dat$c_right_hpc_vs), length.out = 200)
+)
+right_sex_grid$expected_y <- expected_from_polr(right_int, right_sex_grid)
+right_sex_grid <- bind_cols(
+  right_sex_grid,
+  boot_expected_ci(right_dat, y ~ c_ICV + c_right_hpc_vs * Sex, right_sex_grid, seed = 3104)
+)
+
+y_scale <- scale_y_continuous(
+  breaks = 1:4,
+  labels = c("Never", "1-11 d/year", "1-3 d/month", "Weekly or greater"),
+  limits = c(0.75, 4.25)
+)
+
+base_assoc_theme <- theme_bw(base_size = 26) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 36, margin = margin(b = 10)),
+    axis.title = element_text(size = 31),
+    axis.title.x = element_text(margin = margin(t = 8)),
+    axis.title.y = element_text(margin = margin(r = 12)),
+    axis.text = element_text(size = 28, color = "gray20"),
+    legend.title = element_text(size = 30),
+    legend.text = element_text(size = 28),
+    legend.key.height = unit(0.28, "in"),
+    legend.key.width = unit(0.38, "in"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.7),
+    plot.margin = margin(14, 22, 14, 22)
+  )
+
+fig_left_pooled <- ggplot(left_dat, aes(x = c_left_hpc_vs, y = as.numeric(y))) +
+  geom_jitter(height = 0.08, width = 0, alpha = 0.38, size = 2.3, color = "black") +
+  geom_ribbon(
+    data = left_main_grid,
+    aes(x = c_left_hpc_vs, y = expected_y, ymin = ymin, ymax = ymax),
+    inherit.aes = FALSE,
+    alpha = 0.18,
+    fill = "#1f5fd2"
+  ) +
+  geom_line(data = left_main_grid, aes(y = expected_y), linewidth = 1.9, color = "#1f5fd2") +
+  annotate("text", x = 4.15, y = 0.88, label = left_main_label, hjust = 1, vjust = 0,
+           size = 8.2, fontface = "bold") +
+  y_scale +
+  coord_cartesian(xlim = c(-2.6, 4.3)) +
+  labs(
+    x = "HPC-VS connectivity\n(left, z-scored)",
+    y = "Past-year 5+ drinking frequency",
+    title = "A. Left hemisphere"
+  ) +
+  base_assoc_theme
+
+fig_right_pooled <- ggplot(right_dat, aes(x = c_right_hpc_vs, y = as.numeric(y))) +
+  geom_jitter(height = 0.08, width = 0, alpha = 0.38, size = 2.3, color = "black") +
+  geom_ribbon(
+    data = right_main_grid,
+    aes(x = c_right_hpc_vs, y = expected_y, ymin = ymin, ymax = ymax),
+    inherit.aes = FALSE,
+    alpha = 0.18,
+    fill = "#1f5fd2"
+  ) +
+  geom_line(data = right_main_grid, aes(y = expected_y), linewidth = 1.9, color = "#1f5fd2") +
+  annotate("text", x = 4.15, y = 0.88, label = right_main_label, hjust = 1, vjust = 0,
+           size = 8.2, fontface = "bold") +
+  y_scale +
+  coord_cartesian(xlim = c(-2.6, 4.3)) +
+  labs(
+    x = "HPC-VS connectivity\n(right, z-scored)",
+    y = "Past-year 5+ drinking frequency",
+    title = "B. Right hemisphere"
+  ) +
+  base_assoc_theme +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+fig_assoc_pooled <- fig_left_pooled + fig_right_pooled + plot_layout(widths = c(1, 1))
+
+fig_left_by_sex <- ggplot(left_dat, aes(x = c_left_hpc_vs, y = as.numeric(y), color = Sex)) +
+  geom_jitter(height = 0.08, width = 0, alpha = 0.46, size = 2.3) +
+  geom_ribbon(
+    data = left_sex_grid,
+    aes(x = c_left_hpc_vs, y = expected_y, ymin = ymin, ymax = ymax, fill = Sex),
+    inherit.aes = FALSE,
+    alpha = 0.14,
+    color = NA
+  ) +
+  geom_line(data = left_sex_grid, aes(y = expected_y), linewidth = 1.9) +
+  annotate("text", x = 4.15, y = 0.88, label = left_sex_label, hjust = 1, vjust = 0,
+           size = 7.2, fontface = "bold", lineheight = 0.95, color = "black") +
+  scale_color_manual(values = c("F" = "#1f5fd2", "M" = "#f39c12")) +
+  scale_fill_manual(values = c("F" = "#1f5fd2", "M" = "#f39c12"), guide = "none") +
+  y_scale +
+  coord_cartesian(xlim = c(-2.6, 4.3)) +
+  labs(
+    x = "HPC-VS connectivity\n(left, z-scored)",
+    y = "Past-year 5+ drinking frequency",
+    title = "A. Left hemisphere",
+    color = "Sex"
+  ) +
+  base_assoc_theme
+
+fig_right_by_sex <- ggplot(right_dat, aes(x = c_right_hpc_vs, y = as.numeric(y), color = Sex)) +
+  geom_jitter(height = 0.08, width = 0, alpha = 0.46, size = 2.3) +
+  geom_ribbon(
+    data = right_sex_grid,
+    aes(x = c_right_hpc_vs, y = expected_y, ymin = ymin, ymax = ymax, fill = Sex),
+    inherit.aes = FALSE,
+    alpha = 0.14,
+    color = NA
+  ) +
+  geom_line(data = right_sex_grid, aes(y = expected_y), linewidth = 1.9) +
+  annotate("text", x = 4.15, y = 0.88, label = right_sex_label, hjust = 1, vjust = 0,
+           size = 7.2, fontface = "bold", lineheight = 0.95, color = "black") +
+  scale_color_manual(values = c("F" = "#1f5fd2", "M" = "#f39c12")) +
+  scale_fill_manual(values = c("F" = "#1f5fd2", "M" = "#f39c12"), guide = "none") +
+  y_scale +
+  coord_cartesian(xlim = c(-2.6, 4.3)) +
+  labs(
+    x = "HPC-VS connectivity\n(right, z-scored)",
+    y = "Past-year 5+ drinking frequency",
+    title = "B. Right hemisphere",
+    color = "Sex"
+  ) +
+  base_assoc_theme +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+fig_assoc_by_sex <- fig_left_by_sex + fig_right_by_sex + plot_layout(widths = c(1, 1), guides = "collect") &
+  theme(legend.position = "right")
+
+save_figure <- function(plot, basename, width = 18.5, height = 10.2) {
+  png_path <- file.path(OUTPUT_DIR, paste0(basename, ".png"))
+  tif_path <- file.path(OUTPUT_DIR, paste0(basename, ".tif"))
+
+  ggsave(png_path, plot = plot, width = width, height = height, units = "in", dpi = 300, bg = "white")
+  ggsave(tif_path, plot = plot, width = width, height = height, units = "in", dpi = 300, bg = "white", compression = "lzw")
+  cat(png_path, "\n", sep = "")
+  cat(tif_path, "\n", sep = "")
+}
+
+save_figure(fig_assoc_pooled, "Figure3_HPCVS_Ordinal_Association_Pooled_Annotated_300dpi")
+save_figure(fig_assoc_by_sex, "Figure4_HPCVS_Ordinal_Association_BySex_Annotated_300dpi")
+```
+
+# Final Figure 5
+
+This section creates the diagnosis-group HPC-VS connectivity figure reported in
+the manuscript.
+
+```{r final-figure-5}
+set.seed(23)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(rio)
+  library(ggplot2)
+  library(patchwork)
+})
+
+DATA_PATH <- "/Users/tup45568/Library/CloudStorage/OneDrive-TempleUniversity/0.Experiments/HPC_Drinking/averaged_data.sav"
+
+args <- commandArgs(trailingOnly = FALSE)
+file_arg <- args[grepl("^--file=", args)]
+SCRIPT_DIR <- if (length(file_arg) == 1) dirname(normalizePath(sub("^--file=", "", file_arg))) else getwd()
+OUTPUT_DIR <- file.path(SCRIPT_DIR, "Figures")
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+fmt_p_fig <- function(p) {
+  ifelse(p < 0.001, "< .001", paste0("= ", sub("^0", "", formatC(p, format = "f", digits = 3))))
+}
+
+HCP_dat <- rio::import(DATA_PATH)
+
+diagnosis_plot_dat <- HCP_dat %>%
+  mutate(
+    Subject = as.character(Subject),
+    Sex = factor(trimws(Gender), levels = c("F", "M")),
+    alcohol_abuse_dx = case_when(
+      SSAGA_Alc_D4_Ab_Dx == 5 ~ TRUE,
+      SSAGA_Alc_D4_Ab_Dx == 1 ~ FALSE,
+      TRUE ~ NA
+    ),
+    alcohol_dependence_dx = case_when(
+      SSAGA_Alc_D4_Dp_Dx == 5 ~ TRUE,
+      SSAGA_Alc_D4_Dp_Dx == 1 ~ FALSE,
+      TRUE ~ NA
+    ),
+    DxGroup = factor(
+      case_when(
+        alcohol_dependence_dx ~ "Dependence",
+        alcohol_abuse_dx ~ "Abuse",
+        alcohol_abuse_dx == FALSE & alcohol_dependence_dx == FALSE ~ "No AUD",
+        TRUE ~ NA_character_
+      ),
+      levels = c("No AUD", "Abuse", "Dependence")
+    )
+  ) %>%
+  transmute(
+    Subject,
+    Sex,
+    DxGroup,
+    left_hpc_vs = as.numeric(limbic_Left),
+    right_hpc_vs = as.numeric(limbic_Right),
+    ICV = as.numeric(FS_IntraCranial_Vol)
+  ) %>%
+  filter(
+    is.finite(left_hpc_vs),
+    is.finite(right_hpc_vs),
+    is.finite(ICV),
+    !is.na(Sex),
+    !is.na(DxGroup)
+  ) %>%
+  mutate(
+    c_left_hpc_vs = as.numeric(scale(left_hpc_vs)),
+    c_right_hpc_vs = as.numeric(scale(right_hpc_vs)),
+    c_ICV = as.numeric(scale(ICV))
+  ) %>%
+  droplevels()
+
+left_conn_reduced <- lm(c_left_hpc_vs ~ Sex + c_ICV, data = diagnosis_plot_dat)
+left_conn_full <- lm(c_left_hpc_vs ~ DxGroup + Sex + c_ICV, data = diagnosis_plot_dat)
+right_conn_reduced <- lm(c_right_hpc_vs ~ Sex + c_ICV, data = diagnosis_plot_dat)
+right_conn_full <- lm(c_right_hpc_vs ~ DxGroup + Sex + c_ICV, data = diagnosis_plot_dat)
+
+left_p <- anova(left_conn_reduced, left_conn_full)$`Pr(>F)`[2]
+right_p <- anova(right_conn_reduced, right_conn_full)$`Pr(>F)`[2]
+
+diagnosis_long <- diagnosis_plot_dat %>%
+  dplyr::select(Subject, DxGroup, c_left_hpc_vs, c_right_hpc_vs) %>%
+  pivot_longer(
+    cols = c(c_left_hpc_vs, c_right_hpc_vs),
+    names_to = "hemisphere",
+    values_to = "connectivity"
+  ) %>%
+  mutate(
+    hemisphere = factor(
+      hemisphere,
+      levels = c("c_left_hpc_vs", "c_right_hpc_vs"),
+      labels = c(
+        paste0("A. Left hemisphere\nANCOVA p ", fmt_p_fig(left_p)),
+        paste0("B. Right hemisphere\nANCOVA p ", fmt_p_fig(right_p))
+      )
+    )
+  )
+
+fig_diagnosis <- ggplot(diagnosis_long, aes(x = DxGroup, y = connectivity, fill = DxGroup)) +
+  geom_violin(width = 0.92, alpha = 0.36, color = NA, trim = FALSE) +
+  geom_boxplot(width = 0.18, outlier.shape = NA, alpha = 0.75, color = "gray20", linewidth = 0.8) +
+  geom_jitter(width = 0.08, height = 0, alpha = 0.42, size = 2.1, color = "gray15") +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 4.6, fill = "white", color = "black") +
+  facet_wrap(~ hemisphere, nrow = 1) +
+  scale_fill_manual(values = c("No AUD" = "#89e6a8", "Abuse" = "#87bff5", "Dependence" = "#f6b737"), guide = "none") +
+  labs(
+    title = "HPC-VS Connectivity by Alcohol Diagnosis Group",
+    x = "Lifetime DSM-IV alcohol diagnosis group",
+    y = "HPC-VS connectivity (z-scored)"
+  ) +
+  theme_bw(base_size = 24) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 34, margin = margin(b = 10)),
+    strip.background = element_rect(fill = "gray85", color = "gray20", linewidth = 0.9),
+    strip.text = element_text(face = "bold", size = 25, lineheight = 0.95),
+    axis.title = element_text(size = 25),
+    axis.text = element_text(size = 22, color = "gray20"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.7),
+    plot.margin = margin(14, 22, 14, 22)
+  )
+
+png_path <- file.path(OUTPUT_DIR, "Figure_DiagnosisGroup_HPCVS_Connectivity_300dpi.png")
+tif_path <- file.path(OUTPUT_DIR, "Figure_DiagnosisGroup_HPCVS_Connectivity_300dpi.tif")
+ggsave(png_path, plot = fig_diagnosis, width = 15.8, height = 8.8, units = "in", dpi = 300, bg = "white")
+ggsave(tif_path, plot = fig_diagnosis, width = 15.8, height = 8.8, units = "in", dpi = 300, bg = "white", compression = "lzw")
+cat(png_path, "\n", sep = "")
+cat(tif_path, "\n", sep = "")
+```

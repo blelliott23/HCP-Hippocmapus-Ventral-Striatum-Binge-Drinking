@@ -1,0 +1,7 @@
+test,df,LR,p
+Left main effect: add HPC-VS connectivity,1,4.94635622004057,0.02614571836589759
+Right main effect: add HPC-VS connectivity,1,0.0823713284241876,0.7741092142389968
+Left model: add sex,1,14.143263837762333,1.6940257694900005e-4
+Left model: add HPC-VS connectivity x Sex,1,0.03756506148783956,0.8463191107026428
+Right model: add sex,1,14.973633058301402,1.0902394663508605e-4
+Right model: add HPC-VS connectivity x Sex,1,4.650582366872413,0.031043014052782602

@@ -1,0 +1,5 @@
+test,df,LR,p
+Left + age: add HPC-VS connectivity,1,4.065370252693583,0.04377108825282134
+Right + age: add HPC-VS connectivity x Sex,1,4.914440848822778,0.026633082494352662
+Left: add HPC-VS connectivity x Age,1,0.07025258801991185,0.7909693668428144
+Right: add age moderation terms,3,5.169172486668231,0.15982044178637836

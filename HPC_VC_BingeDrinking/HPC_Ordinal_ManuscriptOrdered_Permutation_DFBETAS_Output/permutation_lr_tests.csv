@@ -1,0 +1,7 @@
+test,LR,p_perm,n_success
+"Permutation LR, left main effect",4.94635622004057,0.025397460253974602,10000
+"Permutation LR, right main effect",0.0823713284241876,0.7737226277372263,10000
+"Permutation LR, left model add sex",14.143263837762333,2.9997000299970003e-4,10000
+"Permutation LR, left interaction",0.03756506148783956,0.8505149485051495,10000
+"Permutation LR, right model add sex",14.973633058301402,2.9997000299970003e-4,10000
+"Permutation LR, right interaction",4.650582366872413,0.029497050294970503,10000
